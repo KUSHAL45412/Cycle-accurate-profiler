@@ -1,0 +1,66 @@
+/* 16-bit Signed INT16 SIMD Dot-Product Benchmark for pg.sdot2.
+ *
+ * Evaluates 512 16-bit DSP multiply-accumulate operations:
+ *     acc += va[i] * vb[i];  for i = 0 .. 511
+ *
+ * Packed as 2 INT16 elements per 32-bit word (256 words total).
+ * Accelerated via the CV-X-IF pg.sdot2 custom coprocessor instruction.
+ */
+#include <stdint.h>
+#include "custom_intrinsics.h"
+
+#define N 512
+#define N_WORDS (N / 2)
+
+static uint32_t va_packed[N_WORDS];
+static uint32_t vb_packed[N_WORDS];
+
+static inline int32_t unpack_half(uint32_t w, int i) {
+    return (int32_t)(int16_t)((w >> (16 * i)) & 0xFFFF);
+}
+
+__attribute__((always_inline))
+static inline int32_t dot2_scalar(uint32_t a_packed, uint32_t b_packed, int32_t acc) {
+    int32_t a0 = unpack_half(a_packed, 0);
+    int32_t a1 = unpack_half(a_packed, 1);
+
+    int32_t b0 = unpack_half(b_packed, 0);
+    int32_t b1 = unpack_half(b_packed, 1);
+
+    acc += a0 * b0;
+    acc += a1 * b1;
+
+    return acc;
+}
+
+void benchmark_init(void)
+{
+    for (int w = 0; w < N_WORDS; w++) {
+        uint32_t pa = 0;
+        uint32_t pb = 0;
+        for (int lane = 0; lane < 2; lane++) {
+            int i = w * 2 + lane;
+            int16_t a_val = (int16_t)((i % 17) - 8);
+            int16_t b_val = (int16_t)((i % 13) - 6);
+            pa |= ((uint32_t)(uint16_t)a_val) << (16 * lane);
+            pb |= ((uint32_t)(uint16_t)b_val) << (16 * lane);
+        }
+        va_packed[w] = pa;
+        vb_packed[w] = pb;
+    }
+}
+
+int benchmark_run(void)
+{
+    int32_t acc = 0;
+    for (int w = 0; w < N_WORDS; w++) {
+        uint32_t x = va_packed[w];
+        uint32_t y = vb_packed[w];
+#if USE_PG_SDOT2
+        acc = __builtin_pg_sdot2(x, y, acc);
+#else
+        acc = dot2_scalar(x, y, acc);
+#endif
+    }
+    return acc;
+}

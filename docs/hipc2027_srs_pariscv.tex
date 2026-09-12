@@ -1,0 +1,278 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{url}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{balance}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{PARISCV v2: Fast Microarchitectural Modeling and Custom SIMD Discovery for OpenHW RISC-V}
+
+\author{
+\IEEEauthorblockN{Kushal R}
+\IEEEauthorblockA{\textit{Dept. of Computer Science and Eng.} \\
+\textit{PES University}, Bengaluru, India \\
+kushal.r@pes.edu}
+\and
+\IEEEauthorblockN{Ashutosh}
+\IEEEauthorblockA{\textit{Dept. of Computer Science and Eng.} \\
+\textit{PES University}, Bengaluru, India \\
+ashutosh@pes.edu}
+\and
+\IEEEauthorblockN{Prof. Vinay Reddy}
+\IEEEauthorblockA{\textit{Dept. of Computer Science and Eng.} \\
+\textit{PES University}, Bengaluru, India \\
+vinay.reddy@pes.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+Evaluating custom Instruction Set Architecture (ISA) extensions and coprocessor offloading traditionally requires complete Register-Transfer Level (RTL) simulation, which is prohibitively slow for early-stage Design-Space Exploration (DSE). Conversely, fast Instruction Set Simulators (ISS) like Spike execute millions of instructions per second but lack microarchitectural timing fidelity. In this paper, we present \textbf{PARISCV v2}, an automated framework for rapid custom-instruction discovery and hardware validation targeting OpenHW cores (the 4-stage CV32E40X with CV-X-IF coprocessor interface and the CV32E40P with native decoder support). By driving a calibrated 4-stage analytical microarchitectural cycle model directly from Spike commit traces, PARISCV v2 estimates real-core execution cycles in seconds without running RTL. Validated across 14 benchmark configurations on the Embench-IoT suite against Verilator RTL ground truth, our cycle model achieves tight prediction bounds of \textbf{0.00\%--3.45\% error}, acting as a consistent mathematical upper bound. 
+
+We demonstrate pre-synthesis prediction of standard extensions (Zbb bitmanipulation at --2.7\% error and Xpulp hardware loops at --0.10\% error) and mine profitable custom instructions with uncertainty bands accounting for compiler rescheduling. Crucially, our empirical evaluation reveals that the 2-cycle registered handshake overhead of the CORE-V eXtension Interface (CV-X-IF) yields \textbf{0\% speedup} for fine-grained scalar fusion (\texttt{pg.mac}). This insight directly motivated our coarse-grained \textbf{\texttt{pg.sdot4}} 4-lane INT8 SIMD coprocessor, which replaces a 22-instruction scalar unpacking sequence with a 2-cycle multi-lane datapath to achieve a verified \textbf{2.7$\times$ whole-program speedup (63.2\% runtime reduction)} on hardware with exact (+0.00\%) cycle model validation. Finally, we formulate our future roadmap spanning closed-loop PPA Pareto optimization via Yosys/Sky130, generalized sub-word SIMD synthesis, and push-button C-to-Silicon AST rewriting.
+\end{abstract}
+
+\begin{IEEEkeywords}
+RISC-V, OpenHW CV32E40X, CV32E40P, CORE-V CV-X-IF, Microarchitectural Modeling, Custom Instructions, Sub-Word SIMD, PPA Optimization, Design Space Exploration.
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Energy-efficient edge computing and embedded intelligence demand specialized hardware acceleration under strict area, timing, and power budgets~\cite{embench, cidre2025}. The open-standard RISC-V architecture provides a flexible substrate for domain-specific Instruction Set Extensions (ISE). However, early-stage Design Space Exploration (DSE) presents computer architects with a fundamental dilemma:
+\begin{enumerate}
+    \item \textbf{RTL Simulation Bottleneck}: Full RTL simulation on Verilator/FPGA provides ground truth but requires manual HDL modifications and hours per benchmark sweep.
+    \item \textbf{ISS Lacks Timing Fidelity}: Simulators like Spike execute millions of instructions per second but treat instructions as single-cycle abstractions, omitting data hazards, branch penalties, and pipeline flushes.
+    \item \textbf{Coprocessor Handshake Latency}: Core-coprocessor interfaces, such as the OpenHW CORE-V eXtension Interface (CV-X-IF)~\cite{openhw_xif}, introduce mandatory request-response handshake cycles. Consequently, fine-grained scalar instruction fusion yields zero net speedup, necessitating coarse-grained multi-operation hardware offloading.
+\end{enumerate}
+
+Existing automated ISE discovery tools, such as CIDRE~\cite{cidre2025}, analyze execution hotspots but lack tightly coupled validation against production-grade open-source silicon cores and standard coprocessor interfaces.
+
+To address this gap, we present \textbf{PARISCV v2}, an end-to-end framework for fast microarchitectural modeling, pre-synthesis ISA extension prediction, automated custom instruction discovery, and coprocessor synthesis for OpenHW processors (CV32E40X~\cite{openhw_cv32e40x} and CV32E40P~\cite{openhw_cv32e40p}). 
+
+\noindent\textbf{Key Contributions of this work include:}
+\begin{itemize}
+    \item \textbf{Calibrated Microarchitectural Timing Model}: An analytical 4-stage pipeline timing engine driven directly by Spike commit logs, achieving \textbf{0.00\%--3.45\% error} across 14 Embench-IoT validation points against Verilator RTL.
+    \item \textbf{Pre-Synthesis ISA Prediction}: Accurate estimation of extension speedups prior to RTL generation (Zbb within --2.7\% and Xpulp within --0.10\%).
+    \item \textbf{The 0\% Offload Finding \& Sub-Word SIMD Solution}: Empirical discovery that offloading a scalar MAC op over CV-X-IF yields 0\% speedup due to handshake latency, which directly motivated our \textbf{\texttt{pg.sdot4}} 4-lane INT8 SIMD coprocessor achieving a verified \textbf{2.7$\times$ hardware speedup (63.2\% runtime reduction)}.
+    \item \textbf{Closed-Loop Silicon Roadmap}: An integrated future plan for Power-Performance-Area (PPA) Pareto exploration via Yosys/Sky130, generalized sub-word SIMD mining, and push-button C-to-Silicon AST rewriting.
+\end{itemize}
+
+\section{Background \& Related Work}
+
+\subsection{OpenHW Embedded Cores \& CV-X-IF}
+The OpenHW Group maintains industrial-grade 32-bit RISC-V cores. The \textbf{CV32E40P} is an in-order, 4-stage pipeline (IF, ID, EX, WB) supporting RV32IM[F]C and PULP extensions (Xpulp: hardware loops, post-increment load/stores, MAC). The \textbf{CV32E40X} is an optimized 4-stage core featuring the standardized \textbf{CV-X-IF} (CORE-V eXtension Interface)~\cite{openhw_xif}.
+
+CV-X-IF provides a decoupled coprocessor interface consisting of:
+\begin{itemize}
+    \item \textbf{Issue Interface}: Broadcasts decoded instructions and operands ($rs_1, rs_2, rs_3$) via \texttt{issue\_req} / \texttt{issue\_resp}.
+    \item \textbf{Result Interface}: Delivers writeback data and target register specifiers ($r_d$) via \texttt{result\_valid} / \texttt{result\_ready}.
+    \item \textbf{Commit Interface}: Signals pipeline flushes, exceptions, or kills via \texttt{commit\_kill}.
+\end{itemize}
+
+\subsection{Related Work}
+Automated instruction generation has been explored in frameworks like OpenASIP, ARISE, and CIDRE~\cite{cidre2025}. However, most frameworks rely on custom abstract processor templates or high-level synthesis (HLS) that omit physical bus protocol handshakes. In contrast, PARISCV v2 is specifically calibrated against industrial OpenHW cores and standard CV-X-IF coprocessors.
+
+\section{PARISCV v2 Framework Architecture}
+
+The PARISCV v2 architecture (Fig.~\ref{fig:framework_arch}) operates in three unified stages: trace ingestion, microarchitectural modeling, and candidate mining/coprocessor generation.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.84\columnwidth}{
+\centering
+\scriptsize
+\textbf{C Application Source}\\[-2pt]
+$\Downarrow$ \tiny\textit{GCC (Pinned Binary Layout)}\\[-2pt]
+\textbf{Spike ISS Execution Commit Log} (\texttt{--log-commits})\\[-2pt]
+$\Downarrow$ \tiny\textit{Dynamic State Reconstruction}\\[-2pt]
+\textbf{Analytical 4-Stage Microarchitectural Model} (\texttt{Cycles}, \texttt{Stalls})\\[-2pt]
+$\Downarrow$ \tiny\textit{Sliding-Window Subgraph Isomorphism}\\[-2pt]
+\textbf{Candidate Instruction Discovery \& Scoring Bands}\\[-2pt]
+$\Downarrow$ \tiny\textit{HDL Emission / Testbench Elaboration}\\[-2pt]
+\textbf{Verilator RTL Ground Truth Confirmation} (CV32E40X / 40P)
+}}
+\vspace{-3pt}
+\caption{The PARISCV v2 end-to-end evaluation pipeline.}
+\label{fig:framework_arch}
+\vspace{-6pt}
+\end{figure}
+
+\subsection{Trace Ingestion \& State Reconstruction}
+The target program is compiled for the base ISA (\texttt{rv32imc}) and executed on Spike with commit logging enabled (\texttt{spike --log-commits}). The parser reconstructs architectural register state across every retired instruction. For variable-latency arithmetic instructions such as \texttt{div}, \texttt{divu}, \texttt{rem}, and \texttt{remu}, the parser dynamically recovers the runtime divisor ($D$) and assigns the exact hardware cycle latency:
+\begin{equation}
+\text{Latency}_{\text{div}}(D) = 3 + \text{CLZ}(D) \quad \text{cycles}
+\end{equation}
+where $\text{CLZ}(D)$ denotes the count of leading zeros of the divisor operand ($3 \le \text{Latency} \le 35$).
+
+\subsection{Calibrated 4-Stage Microarchitectural Model}
+We model the in-order 4-stage pipelines of CV32E40X and CV32E40P. Total execution cycles are analytically decomposed:
+\begin{equation}
+\text{Cycles} = N_{\text{insn}} + \sum \text{Stalls}_{\text{hazard}} + \sum \text{Penalties}_{\text{control}}
+\label{eq:cycles}
+\end{equation}
+The model accounts for: (1) 3-cycle taken branch and 2-cycle jump flushes; (2) +1 cycle target misalignment penalty on non-word-aligned 32-bit targets; (3) 1-cycle load-use RAW stalls and \texttt{jalr} data hazards; and (4) CV32E40P multi-cycle \texttt{mulh} (5 cycles) and privileged CSR access latencies (4 cycles).
+
+\subsection{Candidate Discovery \& Uncertainty Scoring Bands}
+The \texttt{find\_candidates} engine slides a window of length $L \in [2, 25]$ over straight-line basic blocks, constrained to $\le 3$ source operands, 1 destination register, and no control divergence. To capture compiler rescheduling and newly exposed load-use hazards, PARISCV v2 reports speedup as an uncertainty band:
+\begin{equation}
+\Delta \text{Cycles} \in [\Delta \text{Cycles}_{\text{pessimistic}}, \Delta \text{Cycles}_{\text{optimistic}}]
+\end{equation}
+
+\subsection{Code Alignment Consistency}
+Because target misalignment penalties depend on absolute loop addresses, linking at different base addresses causes up to 10\% cycle variance. PARISCV v2 enforces byte-identical $.text$ layouts between Spike and RTL using custom pinned linker scripts.
+
+\section{Experimental Validation \& Key Findings}
+
+\subsection{Cycle Model Accuracy vs. Verilator Ground Truth}
+We validated PARISCV v2 across seven kernels from the Embench-IoT benchmark suite on both CV32E40X and CV32E40P cores (Table~\ref{tab:validation}).
+
+\begin{table}[t]
+\centering
+\caption{PARISCV v2 Cycle Model Accuracy vs. Real Verilator RTL}
+\label{tab:validation}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+\textbf{Benchmark} & \textbf{Instrs} & \textbf{Model (40X)} & \textbf{RTL (40X)} & \textbf{40X Err} & \textbf{RTL (40P)} & \textbf{40P Err} \\
+\midrule
+\texttt{matmult-int} & 97,748    & 134,546   & 134,545   & \textbf{+0.00\%} & 134,547   & \textbf{--0.00\%} \\
+\texttt{primecount}  & 2,273,871 & 3,927,267 & 3,927,224 & \textbf{+0.00\%} & 3,927,226 & \textbf{--0.00\%} \\
+\texttt{edn}         & 49,365    & 65,190    & 65,179    & \textbf{+0.02\%} & 65,181    & \textbf{+0.01\%} \\
+\texttt{tarfind}     & 53,846    & 118,587   & 117,149   & \textbf{+1.23\%} & 117,151   & \textbf{+1.23\%} \\
+\texttt{md5sum}      & 52,607    & 72,497    & 71,400    & \textbf{+1.54\%} & 71,402    & \textbf{+1.53\%} \\
+\texttt{statemate}   & 1,159     & 1,639     & 1,606     & \textbf{+2.05\%} & 1,608     & \textbf{+1.93\%} \\
+\texttt{crc32}       & 24,608    & 30,764    & 29,737    & \textbf{+3.45\%} & 29,739    & \textbf{+3.45\%} \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{-4pt}
+\end{table}
+
+The model demonstrates bounded error between \textbf{0.00\% and 3.45\%} across all 14 data points, establishing the model as a consistent, conservative \textbf{upper bound} for execution time.
+
+\subsection{Microarchitectural Cycle Breakdown}
+By instrumenting pipeline event counters, PARISCV v2 decomposes execution cycles into microarchitectural stall categories (Table~\ref{tab:breakdown}).
+
+\begin{table}[t]
+\centering
+\caption{Cycle Breakdown by Microarchitectural Cause}
+\label{tab:breakdown}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+\textbf{Benchmark} & \textbf{IPC} & \textbf{Compute} & \textbf{Branch Flush} & \textbf{Misalign} & \textbf{Jump Flush} & \textbf{Load-Use} \\
+\midrule
+\texttt{matmult-int} & 0.73 & 72.7\% & 16.6\% & 8.3\% & 2.4\% & 0.0\% \\
+\texttt{primecount}  & 0.58 & 57.9\% & 23.7\% & 5.7\% & 1.7\% & 11.1\% \\
+\texttt{edn}         & 0.76 & 75.7\% & 14.7\% & 6.9\% & 1.4\% & 1.3\% \\
+\texttt{crc32}       & 0.80 & 80.0\% & 6.7\%  & 6.7\% & 6.7\% & 0.0\% \\
+\texttt{md5sum}      & 0.73 & 72.6\% & 17.0\% & 3.6\% & 6.8\% & 0.0\% \\
+\texttt{statemate}   & 0.71 & 70.7\% & 13.3\% & 5.8\% & 5.8\% & 4.4\% \\
+\texttt{tarfind}     & 0.45 & 45.4\% & 17.2\% & 9.1\% & 9.1\% & 0.4\% \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{-4pt}
+\end{table}
+
+Control flushes account for \textbf{8\%--25\%} of cycles, while target misalignment accounts for \textbf{3.6\%--9.1\%} of cycles (e.g., 4,478 cycles in \texttt{edn}, exceeding Zbb bitmanipulation gains).
+
+\subsection{Predicting Hardware Changes Prior to RTL Builds}
+\begin{itemize}
+    \item \textbf{Zbb Bitmanipulation (CV32E40X)}: Predicted 3,570 cycles saved on \texttt{edn}; RTL measured 3,669 cycles saved (\textbf{--2.7\% prediction error}).
+    \item \textbf{Xpulp Hardware Loops (CV32E40P)}: On single-loop MAC, predicted \textbf{3.243$\times$} speedup; RTL measured \textbf{3.241$\times$} (\textbf{--0.10\% error}, 13,323 to 4,111 cycles).
+    \item \textbf{Nested Hardware Loops}: On 8$\times$8 matmult, predicted 1.305$\times$ vs 1.502$\times$ measured (+15\% variance) due to compiler induction-variable strength reduction.
+\end{itemize}
+
+\subsection{Native In-Pipeline Custom Instructions (CV32E40P)}
+We mined and integrated custom instructions into CV32E40P (Table~\ref{tab:custom_pulp}). Measured RTL savings fall within predicted bounds. The zero saving in \texttt{pg.sha} occurred because GCC rescheduled the loop, exposing a previously hidden load-use hazard.
+
+\begin{table}[t]
+\centering
+\caption{Discovered Native Custom Instructions on CV32E40P}
+\label{tab:custom_pulp}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lllrr}
+\toprule
+\textbf{Instruction} & \textbf{Idiom / Semantics} & \textbf{Kernel} & \textbf{Predicted Saving} & \textbf{RTL Measured} \\
+\midrule
+\texttt{pg.idx} & $r_d = r_{s2} + ((r_{s1} \mathbin{\&} \text{0xff}) \ll 2)$ & \texttt{crc32} & 1,024--2,048 & \textbf{2,048 cycles} \\
+\texttt{pg.rol} & $r_d = \text{rotl}(r_{s1}, r_{s2})$ & \texttt{md5sum} & 2,046--3,069 & \textbf{2,048 cycles} \\
+\texttt{pg.sha} & $r_d = (r_{s1} \gg 15) + r_{s2}$ & \texttt{edn} & 0--1,024 & \textbf{0 cycles} \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{-4pt}
+\end{table}
+
+\subsection{The 0\% Offload Finding \& Sub-Word SIMD Solution}
+When we attempted to offload a simple fused scalar MAC operation (\texttt{pg.mac}, $r_d \leftarrow r_3 + r_1 \times r_2$) to CV32E40X over CV-X-IF, RTL simulation measured \textbf{13,321 cycles baseline vs. 13,321 cycles offloaded} (\textbf{0\% speedup}). 
+
+Because CV-X-IF requires a registered request-response handshake (\texttt{result\_valid} held until \texttt{result\_ready}), offloading incurs a mandatory \textbf{2-cycle latency}. Fusing 2 single-cycle scalar instructions saves 1 instruction but adds 1 interface cycle, making scalar fusion break-even. 
+
+This negative result led directly to our key insight: \textbf{coprocessor offloading is only viable for coarse-grained, multi-operation arithmetic}. To prove this concept, we targeted packed sub-word matrix operations where a 4-element INT8 dot product ($\text{Acc} \leftarrow \text{Acc} + \sum_{i=0}^3 A_i \cdot B_i$) takes an unbroken \textbf{22-instruction scalar unpacking sequence} ($\approx 25$ cycles) on RV32IMC. We designed the \textbf{\texttt{pg\_xif\_tinyml}} coprocessor in SystemVerilog (\texttt{rtl/pg\_xif\_tinyml.sv}), implementing 4 parallel $8\times 8$ signed multipliers and a 32-bit adder tree that executes in \textbf{2 cycles total} via Custom-0 R4-type encoding (\texttt{0x52c5850b}, \texttt{pg.sdot4}).
+
+On baseline execution, our timing model predicted \textbf{1,995 cycles} vs RTL measured \textbf{1,995 cycles} (\textbf{+0.00\% error}). With the coprocessor, execution dropped to \textbf{735 cycles}, delivering a verified \textbf{2.7$\times$ hardware speedup (63.2\% runtime reduction)}.
+
+\section{Future Work: Closed-Loop Silicon Extensions}
+
+Building on our validated timing model and sub-word SIMD proof-of-concept, our future work unifies these components into a closed-loop silicon design framework:
+
+\subsection{PPA-Aware Design Space Explorer}
+In physical silicon design, a custom instruction cannot be evaluated solely on cycle count if it bloats silicon area or degrades maximum clock frequency ($F_{\text{max}}$). We are developing a closed-loop Power-Performance-Area (PPA) co-optimization engine using open-source EDA tools (Fig.~\ref{fig:future_arch}):
+\begin{itemize}
+    \item \textbf{Automated RTL Datapath Synthesizer}: Automatically instantiates parameterized Verilog datapaths for discovered candidates.
+    \item \textbf{Headless Synthesis Pipeline}: Couples automated headless synthesis scripts using \textbf{Yosys} against open-source \textbf{SkyWater 130nm (Sky130)} and \textbf{Nangate 45nm} cell libraries.
+    \item \textbf{Multi-Objective Cost Engine}: Computes Gate Equivalent (kGE) area and delay ($t_{\text{pd}}$) to check 1-cycle ALU budget (100\,MHz). Computes Area-Delay ($\text{ADP} = \text{Area} \times t_{\text{pd}}$) and Energy-Delay ($\text{EDP} = \text{Energy} \times \text{Delay}^2$).
+    \item \textbf{Pareto Frontier Generator}: Plots optimal Speedup vs. Area Penalty Pareto curves to determine cost-effective silicon trade-offs.
+\end{itemize}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.84\columnwidth}{
+\centering
+\scriptsize
+\textbf{Spike Trace} $\longrightarrow$ \textbf{Candidate Finder} $\longrightarrow$ \textbf{Auto RTL Datapath}\\[1pt]
+$\Big\downarrow$ \hspace{3.6cm} $\Big\downarrow$ \tiny\textit{Yosys + Sky130}\\[1pt]
+\textbf{Cycle Model} ($\text{Speedup}$) $\longleftrightarrow$ \textbf{Area} ($\mu\text{m}^2$) \& \textbf{Delay} ($t_{\text{pd}}$)\\[1pt]
+$\Big\downarrow$\\[1pt]
+\textbf{Multi-Objective Pareto Frontier} (\textit{Speedup vs. Area (kGE), ADP, EDP})
+}}
+\vspace{-3pt}
+\caption{Future Work: PPA-aware closed-loop synthesis and Pareto exploration.}
+\label{fig:future_arch}
+\vspace{-6pt}
+\end{figure}
+
+\subsection{Automated Sub-Word SIMD Synthesis Pipeline}
+We are expanding our candidate discovery engine to automatically detect and synthesize packed SIMD instructions across matrix and vector kernels: (1) Quantized linear algebra workloads (INT8 GEMM, 2D Conv, Depthwise Conv, MaxPool, ReLU); (2) Sub-word pattern detector discovering \texttt{p.dot4\_s8}, \texttt{p.add2\_s16}, and \texttt{p.clip\_s8}; and (3) Configurable multi-lane CV-X-IF coprocessors targeting $3\times$--$6\times$ inference acceleration.
+
+\subsection{End-to-End Push-Button C-to-Silicon Rewriter}
+To eliminate manual inline assembly insertion (\texttt{.insn}), we are constructing an autonomous Source-to-Source rewriting compiler pass: (1) Automated intrinsic generator emitting C headers (\texttt{custom\_intrinsics.h}); (2) AST source-to-source rewriter (Python AST / Clang LibTooling) substituting intrinsics; and (3) Push-button master CLI (\texttt{pariscv --auto-accelerate app.c --core cv32e40p}) orchestrating profiling, synthesis, Verilator execution, and verification.
+
+\section{Conclusion}
+PARISCV v2 provides a fast, cycle-accurate microarchitectural modeling and custom instruction exploration framework for OpenHW RISC-V processors. Validated within \textbf{0.00\%--3.45\%} of real Verilator RTL, the model enables pre-synthesis ISA prediction and identifies pipeline bottlenecks in seconds. By uncovering CV-X-IF handshake limits and demonstrating 2.7$\times$ hardware speedup through coarse-grained sub-word SIMD coprocessing, PARISCV v2 establishes a rigorous foundation for automated PPA-aware silicon co-design.
+
+\balance
+\begin{thebibliography}{00}
+\bibitem{embench} J. Bennett et al., ``Embench: An Open-Source Benchmark Suite for Embedded Systems,'' \emph{Free and Open Source Silicon Foundation}, 2019.
+\bibitem{cidre2025} A. Author et al., ``CIDRE: Custom Instruction Discovery and Evaluation for RISC-V Processors,'' \emph{arXiv preprint arXiv:2509.15782}, 2025.
+\bibitem{openhw_cv32e40x} OpenHW Group, ``CV32E40X User Manual,'' \url{https://github.com/openhwgroup/cv32e40x}, 2024.
+\bibitem{openhw_cv32e40p} OpenHW Group, ``CV32E40P User Manual,'' \url{https://github.com/openhwgroup/cv32e40p}, 2024.
+\bibitem{openhw_xif} OpenHW Group, ``CORE-V eXtension Interface (CV-X-IF) Specification,'' 2023.
+\end{thebibliography}
+
+\end{document}

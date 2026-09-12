@@ -1,0 +1,144 @@
+diff --git a/rtl/cv32e40p_alu.sv b/rtl/cv32e40p_alu.sv
+index aa900a7..6a369b0 100644
+--- a/rtl/cv32e40p_alu.sv
++++ b/rtl/cv32e40p_alu.sv
+@@ -253,8 +253,15 @@ module cv32e40p_alu
+   // choose the bit reversed or the normal input for shift operand a
+   assign shift_op_a    = shift_left ? operand_a_rev :
+                           (shift_use_round ? adder_round_result : operand_a_i);
++  // PARAGATO: rol(x, n) is ror(x, 32-n), so ALU_PGROL feeds the existing
++  // rotate-right shifter a negated amount. Masking to 5 bits makes n==0 rotate
++  // by 0 rather than 32.
++  logic [31:0] shift_amt_rol;
++  assign shift_amt_rol = {27'b0, (5'd0 - shift_amt[4:0])};
++
+   assign shift_amt_int = shift_use_round ? shift_amt_norm :
+-                          (shift_left ? shift_amt_left : shift_amt);
++                          ((operator_i == ALU_PGROL) ? shift_amt_rol :
++                          (shift_left ? shift_amt_left : shift_amt));
+ 
+   assign shift_amt_norm = is_clpx_i ? {clpx_shift_ex, clpx_shift_ex} : {4{3'b000, bmask_b_i}};
+ 
+@@ -263,7 +270,7 @@ module cv32e40p_alu
+   // right shifts, we let the synthesizer optimize this
+   logic [63:0] shift_op_a_32;
+ 
+-  assign shift_op_a_32 = (operator_i == ALU_ROR) ? {
++  assign shift_op_a_32 = ((operator_i == ALU_ROR) || (operator_i == ALU_PGROL)) ? {
+         shift_op_a, shift_op_a
+       } : $signed(
+           {{32{shift_arithmetic & shift_op_a[31]}}, shift_op_a}
+@@ -929,6 +936,20 @@ module cv32e40p_alu
+     result_o = '0;
+ 
+     unique case (operator_i)
++      // PARAGATO custom instruction: table-index address generation.
++      //   rd = rs2 + ((rs1 & 0xff) << 2)
++      // Replaces the four-instruction `andi; mv; slli; add` sequence that
++      // computes a byte-indexed word-table address -- the hot path of a
++      // table-driven CRC, and the top candidate reported by
++      // model/find_candidates.py on Embench crc32 (10.0% of all cycles).
++      // Purely combinational, so it retires in one cycle like any ALU op.
++      ALU_PGIDX: result_o = operand_b_i + {22'b0, operand_a_i[7:0], 2'b0};
++
++      // PARAGATO: rd = (rs1 >>> 15) + rs2, fixed arithmetic shift (see pkg
++      // for provenance). Purely combinational -- the shift amount is a
++      // hardware constant, so it does not need the general shifter datapath.
++      ALU_PGSHA: result_o = $unsigned($signed(operand_a_i) >>> 15) + operand_b_i;
++
+       // Standard Operations
+       ALU_AND: result_o = operand_a_i & operand_b_i;
+       ALU_OR:  result_o = operand_a_i | operand_b_i;
+@@ -939,7 +960,7 @@ module cv32e40p_alu
+       ALU_SUB, ALU_SUBR, ALU_SUBU, ALU_SUBUR,
+       ALU_SLL,
+       ALU_SRL, ALU_SRA,
+-      ALU_ROR:
++      ALU_ROR, ALU_PGROL:
+       result_o = shift_result;
+ 
+       // bit manipulation instructions
+diff --git a/rtl/cv32e40p_decoder.sv b/rtl/cv32e40p_decoder.sv
+index 3b48679..68ece4c 100644
+--- a/rtl/cv32e40p_decoder.sv
++++ b/rtl/cv32e40p_decoder.sv
+@@ -2905,6 +2905,48 @@ module cv32e40p_decoder import cv32e40p_pkg::*; import cv32e40p_apu_core_pkg::*;
+               hwlp_cnt_mux_sel_o    = 1'b0;
+             end
+ 
++            // PARAGATO: pg.add3 rd, rs1, rs2  ->  rd <- rs1 + rs2
++            // Shares OPCODE_HWLOOP (7'h7b) with the lp.* instructions above,
++            // using funct3=110, which they leave unused (000..101 taken).
++            // An earlier attempt claimed this whole opcode outright and
++            // silently broke every lp.* instruction: OPCODE_HWLOOP is a real,
++            // populated opcode, not free space, so a new instruction must slot
++            // into an unused funct3 rather than override the case.
++            3'b110: begin
++              regfile_alu_we = 1'b1;
++              rega_used_o    = 1'b1;
++              regb_used_o    = 1'b1;
++              unique case (instr_rdata_i[31:25])
++                // pg.add3 rd, rs1, rs2 -> rd = rs1 + rs2 (proof that a new
++                // instruction can be added by a decoder edit alone)
++                7'b0000000: alu_operator_o = ALU_ADD;
++                // pg.rol rd, rs1, rs2 -> rd = rotate_left(rs1, rs2)
++                7'b0000001: alu_operator_o = ALU_PGROL;
++                // pg.sha rd, rs1, rs2 -> rd = (rs1 >>> 15) + rs2
++                7'b0000010: alu_operator_o = ALU_PGSHA;
++                default: begin
++                  regfile_alu_we = 1'b0;
++                  illegal_insn_o = 1'b1;
++                end
++              endcase
++            end
++
++            // PARAGATO: pg.idx rd, rs1, rs2  ->  rd = rs2 + ((rs1 & 0xff) << 2)
++            // funct3=111, the other slot OPCODE_HWLOOP leaves unused.
++            // Discovered by model/find_candidates.py as the top candidate on
++            // Embench crc32: it replaces the `andi; mv; slli; add` table-address
++            // sequence, worth 10.0% of all cycles there.
++            3'b111: begin
++              if (instr_rdata_i[31:25] == 7'b0000000) begin
++                regfile_alu_we = 1'b1;
++                rega_used_o    = 1'b1;
++                regb_used_o    = 1'b1;
++                alu_operator_o = ALU_PGIDX;
++              end else begin
++                illegal_insn_o = 1'b1;
++              end
++            end
++
+             default: begin
+               illegal_insn_o = 1'b1;
+             end
+diff --git a/rtl/include/cv32e40p_pkg.sv b/rtl/include/cv32e40p_pkg.sv
+index 61dce0f..34e34d0 100644
+--- a/rtl/include/cv32e40p_pkg.sv
++++ b/rtl/include/cv32e40p_pkg.sv
+@@ -84,6 +84,26 @@ package cv32e40p_pkg;
+ 
+   typedef enum logic [ALU_OP_WIDTH-1:0] {
+ 
++    // PARAGATO: table-index address generation.
++    //   rd = rs2 + ((rs1 & 0xff) << 2)
++    // Discovered by model/find_candidates.py as the top candidate on Embench
++    // crc32 (10.0% of all cycles): the four-instruction table-address sequence
++    // `andi; mv; slli; add` at the heart of a table-driven CRC inner loop.
++    ALU_PGIDX = 7'b0001110,
++
++    // PARAGATO: variable rotate-left, rd = rol(rs1, rs2).
++    // Discovered by model/find_candidates.py on Embench md5sum as the
++    // `sll; sub; srl; or` idiom (4 instructions, 4.2% of cycles). Implemented
++    // by reusing the existing rotate-right datapath: rol(x,n) == ror(x,32-n).
++    ALU_PGROL = 7'b0001111,
++
++    // PARAGATO: fixed-shift-then-add. rd = (rs1 >>> 15) + rs2 (arithmetic).
++    // Discovered by find_candidates.py on Embench edn as the `srai; add`
++    // idiom. Unlike pg.rol's variable shift, this one is a compile-time
++    // constant (15) specific to this application -- an application-specific
++    // instruction in the literal sense, not a general-purpose one.
++    ALU_PGSHA = 7'b0100001,
++
+     ALU_ADD   = 7'b0011000,
+     ALU_SUB   = 7'b0011001,
+     ALU_ADDU  = 7'b0011010,
